@@ -217,6 +217,21 @@ public struct ResolutionScaleCard: View {
     let isFavoriteDefault: Bool
     let tagLabel: String?
     let onSelect: () -> Void
+    var onToggleFavorite: (() -> Void)? = nil
+
+    public init(
+        mode: DisplayResolutionMode,
+        isFavoriteDefault: Bool,
+        tagLabel: String?,
+        onSelect: @escaping () -> Void,
+        onToggleFavorite: (() -> Void)? = nil
+    ) {
+        self.mode = mode
+        self.isFavoriteDefault = isFavoriteDefault
+        self.tagLabel = tagLabel
+        self.onSelect = onSelect
+        self.onToggleFavorite = onToggleFavorite
+    }
 
     public var body: some View {
         Button(action: onSelect) {
@@ -226,7 +241,15 @@ public struct ResolutionScaleCard: View {
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundColor(mode.isCurrent ? .white : .primary)
                     Spacer()
-                    if isFavoriteDefault {
+                    if let onToggle = onToggleFavorite {
+                        Button(action: onToggle) {
+                            Image(systemName: isFavoriteDefault ? "star.fill" : "star")
+                                .font(.system(size: 12))
+                                .foregroundColor(isFavoriteDefault ? .yellow : (mode.isCurrent ? .white.opacity(0.7) : .secondary))
+                        }
+                        .buttonStyle(.plain)
+                        .help(isFavoriteDefault ? "已设为常用默认分辨率 (点击取消)" : "设为常用默认分辨率")
+                    } else if isFavoriteDefault {
                         Image(systemName: "star.fill")
                             .font(.system(size: 11))
                             .foregroundColor(.yellow)

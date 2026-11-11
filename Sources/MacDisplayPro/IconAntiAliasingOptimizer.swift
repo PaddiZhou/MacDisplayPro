@@ -158,21 +158,36 @@ public final class IconAntiAliasingOptimizer: ObservableObject {
         return repairedCount
     }
 
-    /// Locks the macOS Dock icon tile size & Launchpad grid to an exact harmonic multiple of both the `.icns` 256x256 asset
-    /// AND the 15/16 (3840/4096) physical 4K pixel grid (`64pt` = 128px @2x = 120.000 physical pixels; `48pt` = 96px @2x = 90.000 physical pixels).
-    /// This eliminates the Moiré interference ("轻微毛边") caused by double fractional resampling.
+    /// Adjusts the macOS Dock icon tile size cleanly without tampering with other system preferences.
+    public func setDockTileSize(tileSizePt: Int, restartDock: Bool = true) {
+        let cmd = "defaults write com.apple.dock tilesize -int \(tileSizePt)" + (restartDock ? " && killall Dock" : "")
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        proc.arguments = ["-c", cmd]
+        try? proc.run()
+        proc.waitUntilExit()
+    }
+
+    /// Legacy helper: sets Dock tile size cleanly
     public func alignDockToHarmonicPixelGrid(tileSizePt: Int = 64) {
+        setDockTileSize(tileSizePt: tileSizePt, restartDock: false)
+    }
+
+    /// Restores default macOS Dock preferences (removes custom overrides)
+    public func restoreDefaultDockPreferences() {
         let cmd = """
-        defaults write com.apple.dock tilesize -int \(tileSizePt)
-        defaults write com.apple.dock largesize -int 128
-        defaults write com.apple.dock springboard-columns -int 7
-        defaults write com.apple.dock springboard-rows -int 5
+        defaults delete com.apple.dock tilesize 2>/dev/null || true
+        defaults delete com.apple.dock largesize 2>/dev/null || true
+        defaults delete com.apple.dock springboard-columns 2>/dev/null || true
+        defaults delete com.apple.dock springboard-rows 2>/dev/null || true
+        killall Dock 2>/dev/null || true
         """
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
         proc.arguments = ["-c", cmd]
         try? proc.run()
         proc.waitUntilExit()
+        lastOptimizationLog = "已重置 Dock 尺寸与启动台网格为系统默认值。"
     }
 
     // MARK: - 2. Rebuild @2x Retina Icon & Dock Bitmap Cache

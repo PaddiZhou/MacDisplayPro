@@ -94,11 +94,17 @@ public final class AutoAdaptEngine {
             category = .fhd1080p
         }
 
+        var wMM: Double = 0, hMM: Double = 0, diagInches: Double = 0, ppi: Double = 0
+        MDP_GetDisplayPhysicalMetrics(display.id, &wMM, &hMM, &diagInches, &ppi)
+
+        let key = display.persistentKey
         let (bestMode, altModes, needsMirror) = pickOptimalMode(
+            displayKey: key,
             category: category,
             nativeWidth: maxNativeW,
             nativeHeight: maxNativeH,
             maxRefreshRate: maxHz,
+            ppi: ppi,
             hiDPIModes: display.hiDPIModes,
             loDPIModes: display.loDPIModes,
             allModes: allModes
@@ -113,9 +119,9 @@ public final class AutoAdaptEngine {
 
         let (recBrightness, recWarmth) = computeCircadianLuminance()
 
-        let key = String(format: "%04X-%04X-%u", display.vendorID, display.modelID, display.serialNumber)
         let recModeDesc = bestMode.map { "\($0.resolutionText) @ \($0.refreshRateText) (\($0.isHiDPI ? "HiDPI 2x" : "原生 1x"))" } ?? "保持当前"
-        let summary = "识别为【\(category.rawValue)】(物理面板 \(maxNativeW)×\(maxNativeH) @ \(Int(maxHz))Hz) → 默认黄金模式: \(recModeDesc)"
+        let ppiText = ppi > 10 ? String(format: " • 约 %.0f PPI (%.1f 吋)", ppi, diagInches) : ""
+        let summary = "识别为【\(category.rawValue)】(物理面板 \(maxNativeW)×\(maxNativeH) @ \(Int(maxHz))Hz\(ppiText)) → 推荐模式: \(recModeDesc)"
 
         return SmartDisplayProfile(
             id: display.id,
@@ -135,20 +141,37 @@ public final class AutoAdaptEngine {
     }
 
     private func pickOptimalMode(
+        displayKey: String,
         category: SmartDisplayProfile.PanelCategory,
         nativeWidth: Int,
         nativeHeight: Int,
         maxRefreshRate: Double,
+        ppi: Double,
         hiDPIModes: [DisplayResolutionMode],
         loDPIModes: [DisplayResolutionMode],
         allModes: [DisplayResolutionMode]
     ) -> (best: DisplayResolutionMode?, alternatives: [DisplayResolutionMode], needsMirror: Bool) {
 
+        // 1. If user previously selected and saved a preferred mode for this display, honor it unconditionally!
+        if let savedModeID = loadUserResolutionPreference(displayKey: displayKey),
+           let matched = (hiDPIModes + loDPIModes).first(where: { $0.id == savedModeID }) {
+            return (matched, Array(hiDPIModes.prefix(6)), false)
+        }
+
+        // 2. Intelligent mode suggestion based on physical PPI and aspect ratio
         let preferredWidths: [Int]
         switch category {
         case .uhd4KOrHigher:
-            // Prioritize 1920x1080 HiDPI (3840x2160 1:1 pixel-perfect 4K 2x Retina) as #1 user favorite default mode!
-            preferredWidths = [1920, 2048, 2304, 2560]
+            if ppi >= 200 {
+                // 5K or small 4K (high PPI Retina): standard 2x integer (e.g. 2560x1440 on 5K)
+                preferredWidths = [2560, 2048, 2304, 1920]
+            } else if ppi >= 155 {
+                // Standard 27-inch 4K (~163 PPI): 1920x1080 (1:1 integer Retina) or 2048x1152 comfortable
+                preferredWidths = [1920, 2048, 2304, 2560]
+            } else {
+                // 32-inch+ 4K (~138 PPI): larger canvas
+                preferredWidths = [2048, 2304, 2560, 1920]
+            }
         case .qhd2K:
             preferredWidths = [2048, 2304, 2560, 1920]
         case .ultrawide:
@@ -211,11 +234,11 @@ public final class AutoAdaptEngine {
     public func computeCircadianLuminance() -> (brightness: Double, warmth: Double) {
         let hour = Calendar.current.component(.hour, from: Date())
         if hour >= 8 && hour < 19 {
-            return (92.0, 0.0)
+            return (80.0, 0.0)
         } else if hour >= 19 && hour < 22 {
-            return (92.0, 0.0)
+            return (65.0, 0.12)
         } else {
-            return (75.0, 0.20)
+            return (45.0, 0.25)
         }
     }
 
@@ -231,19 +254,19 @@ public final class AutoAdaptEngine {
 
     /// Locks the current resolution, bit-depth, anti-aliasing and sharpness as the permanent default for this display
     public func lockCurrentDisplayStateAsDefault(_ display: ManagedDisplay) -> String {
-        let key = String(format: "%04X-%04X-%u", display.vendorID, display.modelID, display.serialNumber)
+        let key = display.persistentKey
         if let cur = display.currentMode {
             saveUserResolutionPreference(displayKey: key, modeID: cur.id)
         }
         _ = MDP_LockHighestBitDepthForCurrentMode(display.id)
         isAutoAdaptOnLaunchEnabled = true
         let modeDesc = display.currentMode.map { "\($0.resolutionText) (\($0.backingResolutionText)) @ \($0.refreshRateText)" } ?? "当前模式"
-        return "📌 已将【\(modeDesc) + 16-bit FP16 高位深管线 + 细腻去锯齿】锁定为永久默认配置！"
+        return "📌 已将【\(display.name) - \(modeDesc)】锁定为该显示器的默认偏好！"
     }
 
     private var launchAgentURL: URL {
         FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/LaunchAgents/com.jinlong.MacDisplayPro.plist")
+            .appendingPathComponent("Library/LaunchAgents/com.paddizhou.MacDisplayPro.plist")
     }
 
     public var isLaunchAtLoginEnabled: Bool {
@@ -260,7 +283,7 @@ public final class AutoAdaptEngine {
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
 
         let plist: [String: Any] = [
-            "Label": "com.jinlong.MacDisplayPro",
+            "Label": "com.paddizhou.MacDisplayPro",
             "ProgramArguments": [appExecutablePath],
             "RunAtLoad": true,
             "KeepAlive": false

@@ -41,6 +41,7 @@ public final class DisplayStore: ObservableObject {
     @Published public var ddcMuted: [CGDirectDisplayID: Bool] = [:]
     @Published public var xdrLuminanceFactor: [CGDirectDisplayID: Double] = [:]
     @Published public var warmthFactor: [CGDirectDisplayID: Double] = [:]
+    @Published public var autoGuardRGB444: [String: Bool] = [:]
     @Published public var statusMessage: String = "就绪"
     @Published public var mediaKeysInterceptEnabled: Bool = false {
         didSet {
@@ -150,7 +151,7 @@ public final class DisplayStore: ObservableObject {
             // 3. Sync Apple Native Brightness (Built-in Retina / Apple Studio Display / DisplayServices)
             if let nativeB = DDCController.shared.getNativeBrightness(displayID: id) {
                 let pct = Double((nativeB * 100.0).rounded())
-                if abs((ddcBrightness[id] ?? 92.0) - pct) >= 1.0 {
+                if abs((ddcBrightness[id] ?? 80.0) - pct) >= 1.0 {
                     ddcBrightness[id] = pct
                 }
             } else if disp.supportsDDC {
@@ -170,7 +171,7 @@ public final class DisplayStore: ObservableObject {
                         let val = Double(res.currentValue)
                         switch codeToRead {
                         case .brightness:
-                            if abs((self.ddcBrightness[id] ?? 92.0) - val) >= 1.0 {
+                            if abs((self.ddcBrightness[id] ?? 80.0) - val) >= 1.0 {
                                 self.ddcBrightness[id] = val
                             }
                         case .contrast:
@@ -288,6 +289,10 @@ public final class DisplayStore: ObservableObject {
             if ddcMuted[id] == nil { ddcMuted[id] = false }
             if xdrLuminanceFactor[id] == nil { xdrLuminanceFactor[id] = 1.0 }
             if warmthFactor[id] == nil { warmthFactor[id] = 0.0 }
+            if autoGuardRGB444[disp.persistentKey] == nil {
+                let saved = UserDefaults.standard.object(forKey: "mdp.autoGuardRGB444.\(disp.persistentKey)") as? Bool
+                autoGuardRGB444[disp.persistentKey] = saved ?? true
+            }
         }
 
         self.displays = newDisplays
@@ -302,6 +307,39 @@ public final class DisplayStore: ObservableObject {
         }
     }
 
+    // MARK: - Per-Display Favorite Modes & RGB Guard
+    public func isFavoriteMode(_ mode: DisplayResolutionMode, for disp: ManagedDisplay) -> Bool {
+        if let saved = AutoAdaptEngine.shared.loadUserResolutionPreference(displayKey: disp.persistentKey) {
+            return saved == mode.id
+        }
+        if let profile = smartProfiles[disp.id], let rec = profile.recommendedMode {
+            return rec.id == mode.id
+        }
+        return mode.width == 1920 && mode.height == 1080
+    }
+
+    public func toggleFavoriteMode(_ mode: DisplayResolutionMode, for disp: ManagedDisplay) {
+        let currentlyFav = isFavoriteMode(mode, for: disp)
+        if currentlyFav {
+            UserDefaults.standard.removeObject(forKey: "mdp.savedMode.\(disp.persistentKey)")
+            statusMessage = "已取消 \(disp.name) 的常用分辨率锁定"
+        } else {
+            AutoAdaptEngine.shared.saveUserResolutionPreference(displayKey: disp.persistentKey, modeID: mode.id)
+            statusMessage = "已将 \(mode.resolutionText) 设为 \(disp.name) 的常用默认分辨率"
+        }
+        objectWillChange.send()
+    }
+
+    public func isAutoGuardRGB444Enabled(for disp: ManagedDisplay) -> Bool {
+        autoGuardRGB444[disp.persistentKey] ?? true
+    }
+
+    public func setAutoGuardRGB444(for disp: ManagedDisplay, enabled: Bool) {
+        autoGuardRGB444[disp.persistentKey] = enabled
+        UserDefaults.standard.set(enabled, forKey: "mdp.autoGuardRGB444.\(disp.persistentKey)")
+        objectWillChange.send()
+    }
+
     // MARK: - Smart Auto-Adaptation Engine
 
     /// Automatically adapts all connected displays (or on hotplug)
@@ -313,7 +351,8 @@ public final class DisplayStore: ObservableObject {
             }
             if let profile = smartProfiles[disp.id] {
                 // Ensure Pure RGB 4:4:4 Full Range link is preserved in SDR mode if macOS System Settings reset it to [2] YCbCr Limited Range
-                if !disp.isBuiltin && ColorAndHardwareEngine.shared.userSelectedHDR12Bit[disp.id] != true {
+                let shouldGuardRGB = isAutoGuardRGB444Enabled(for: disp)
+                if shouldGuardRGB && !disp.isBuiltin && ColorAndHardwareEngine.shared.userSelectedHDR12Bit[disp.id] != true {
                     let tel = MDP_GetDisplayHardwareTelemetry(disp.id)
                     if tel.activeEOTF == 0 && (tel.activePixelEncoding != 0 || tel.activeDynamicRange != 1) {
                         _ = MDP_ForceRGB444FullRangeLink(disp.id)

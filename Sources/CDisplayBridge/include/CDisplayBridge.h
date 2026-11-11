@@ -118,8 +118,17 @@ bool MDP_ConfigureHardwareMirror(CGDirectDisplayID sourceDisplay, CGDirectDispla
 // ============================================================================
 
 typedef struct {
-    uint32_t maxBpc;                // e.g. 12 (12-bit per channel supported by EDID/Sink)
-    uint32_t maxPixelRateMHz;       // e.g. 594 (594 MHz = HDMI 2.0 18Gbps)
+    int32_t index;
+    uint32_t bitDepth;
+    uint32_t range;         // 0 = Limited (16-235), 1 = Full Range (0-255)
+    uint32_t eotf;          // 0 = SDR Gamma, 2 = HDR10 (SMPTE ST 2084 PQ), 3 = HLG
+    uint32_t pixelEncoding; // 0 = Pure RGB 4:4:4, 1 = YCbCr 4:2:0, 2 = YCbCr 4:2:2, 3 = YCbCr 4:4:4 / YCbCr
+    bool isActive;
+} MDP_LinkDescriptionItem;
+
+typedef struct {
+    uint32_t maxBpc;                // e.g. 10 or 12 (bits per color component supported by EDID/Sink)
+    uint32_t maxPixelRateMHz;       // e.g. 594 (HDMI 2.0 18Gbps) or 1200+ (DP 1.4 / HDMI 2.1)
     uint32_t maxGPUSrcBufferWidth;  // e.g. 16384 (16K max source buffer width)
     uint32_t currentCGSDepthCode;   // e.g. 8 = kCGS16BitFloat (64-bit RGBA FP16 pipeline)
     uint32_t activeLinkBitDepth;    // Active hardware link bpc (8, 10, 12)
@@ -129,10 +138,23 @@ typedef struct {
     bool supportsHDR10EOTF;         // SMPTE ST 2084 PQ supported in ColorModes
     bool supports12BitMode;         // 12-bit ColorMode present
     bool supports10BitMode;         // 10-bit ColorMode present
+    double physicalWidthMM;         // Panel physical width in mm (CGDisplayScreenSize)
+    double physicalHeightMM;        // Panel physical height in mm (CGDisplayScreenSize)
+    double physicalDiagonalInches;  // Calculated diagonal screen size (e.g. 27.0)
+    double calculatedPPI;           // Physical PPI based on native panel resolution & screen size
 } MDP_HardwareTelemetry;
 
 /// Queries IOMobileFramebufferAP / IORegistry, SkyLight LinkDescriptions, and CGS for deep hardware capabilities
 MDP_HardwareTelemetry MDP_GetDisplayHardwareTelemetry(CGDirectDisplayID displayID);
+
+/// Enumerates all supported hardware output link descriptions for the current mode of displayID
+int32_t MDP_GetDisplayOutputLinkDescriptions(CGDirectDisplayID displayID, MDP_LinkDescriptionItem *outItems, int32_t maxItems, int32_t *outCurrentIndex);
+
+/// Switches the active display link to a specific link description by its index
+bool MDP_SetDisplayOutputLinkByIndex(CGDirectDisplayID displayID, int32_t index);
+
+/// Retrieves physical display dimensions in millimeters, diagonal inches, and calculates physical PPI
+void MDP_GetDisplayPhysicalMetrics(CGDirectDisplayID displayID, double *outWidthMM, double *outHeightMM, double *outDiagonalInches, double *outPPI);
 
 /// Ensures the display's current resolution is running at the highest CGS framebuffer bit depth (depth=8 FP16 / 10-bit+)
 /// AND forces Pure RGB 4:4:4 Full Range (0-255) on the HDMI/DP link to eliminate YCbCr chroma subsampling jagged edges

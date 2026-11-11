@@ -20,9 +20,9 @@ public enum BitDepthChoice: Int, CaseIterable, Identifiable {
 
     public var subtitle: String {
         switch self {
-        case .bit10: return "标准 10.7 亿色直出"
-        case .bit12: return "8+4bit / 10+2bit 时空抖动消除断层"
-        case .bit16: return "FP16 浮点渲染 + 蓝噪声满血抖动 (推荐)"
+        case .bit10: return "标准 10-bit 灰阶 (1024 级线性采样)"
+        case .bit12: return "12-bit 增强色彩表 (4096 级精度采样)"
+        case .bit16: return "16-bit FP16 浮点合成 + 1024 级平滑抗断层查找表"
         }
     }
 }
@@ -47,38 +47,46 @@ public struct DisplayHardwareTelemetryModel {
     public let supportsHDR10EOTF: Bool
     public let supports12BitMode: Bool
     public let supports10BitMode: Bool
+    public let physicalWidthMM: Double
+    public let physicalHeightMM: Double
+    public let physicalDiagonalInches: Double
+    public let calculatedPPI: Double
+
+    public var physicalDimensionsDescription: String {
+        if physicalDiagonalInches > 0.5 {
+            return String(format: "%.1f 吋 (%.0f × %.0f mm) • 约 %.0f PPI", physicalDiagonalInches, physicalWidthMM, physicalHeightMM, calculatedPPI)
+        }
+        return "尺寸未知"
+    }
 
     public var framebufferDepthDescription: String {
         let encStr: String
         switch activePixelEncoding {
         case 0: encStr = "RGB 4:4:4 全色度"
-        case 2: encStr = "YCbCr 4:2:2 色度压缩"
-        default: encStr = "YCbCr 4:2:0 色度压缩"
+        case 2: encStr = "YCbCr 4:2:2"
+        default: encStr = "YCbCr 4:2:0"
         }
         let rangeStr = (activeDynamicRange == 1) ? "Full Range (0-255)" : "Limited (16-235)"
-        let eotfStr = (activeEOTF == 2) ? "HDR10 (EOTF=2 PQ)" : "SDR (EOTF=0)"
+        let eotfStr = (activeEOTF == 2) ? "HDR10" : "SDR"
         switch currentCGSDepthCode {
         case 8:
-            return "16-bit FP16 渲染 → 硬件链路: \(activeLinkBitDepth)-bit • \(encStr) • \(rangeStr) • \(eotfStr)"
+            return "16-bit FP16 渲染 → 链路: \(activeLinkBitDepth)-bit • \(encStr) • \(rangeStr) • \(eotfStr)"
         case 6, 7:
-            return "10-bit 渲染 → 硬件链路: \(activeLinkBitDepth)-bit • \(encStr) • \(rangeStr) • \(eotfStr)"
+            return "10-bit 渲染 → 链路: \(activeLinkBitDepth)-bit • \(encStr) • \(rangeStr) • \(eotfStr)"
         default:
-            return "8-bit 渲染 → 硬件链路: \(activeLinkBitDepth)-bit • \(encStr) • \(rangeStr) • \(eotfStr)"
+            return "8-bit 渲染 → 链路: \(activeLinkBitDepth)-bit • \(encStr) • \(rangeStr) • \(eotfStr)"
         }
     }
 
     public var physicalLinkAnalysis: String {
         let isRGB444 = (activePixelEncoding == 0)
-        if maxPixelRateMHz <= 600 {
-            if isRGB444 {
-                return "✅ 当前处于 [4] 档：8-bit Pure RGB 4:4:4 全色度 + Full Range (0-255, SDR) • 零彩色毛边"
-            } else if activeLinkBitDepth == 12 && activeEOTF == 2 {
-                return "🔥 当前处于 [1] 档：12-bit HDR10 (EOTF=2, YCbCr 4:2:2, Limited 16-235) • 原生 12-bit 高动态范围已开启"
-            } else {
-                return "⚠️ 当前处于 [\(activeLinkBitDepth)-bit EOTF=\(activeEOTF) Encoding=\(activePixelEncoding)] YCbCr 色度压缩模式 • 可随时一键切换 [4] RGB 4:4:4 或 [1] 12-bit HDR10"
-            }
+        let isFull = (activeDynamicRange == 1)
+        if isRGB444 && isFull {
+            return "✅ RGB 4:4:4 全色度 + Full Range (0-255) • 零色度压缩与彩色边缘毛边"
+        } else if activeEOTF == 2 {
+            return "🔥 HDR10 模式已激活 (\(activeLinkBitDepth)-bit \(activePixelEncoding == 2 ? "YCbCr 4:2:2" : "YCbCr") • EOTF=2)"
         } else {
-            return "DisplayPort / Thunderbolt 高速链路 (峰值时钟 \(maxPixelRateMHz) MHz) • 面板支持最高 \(maxBpc)-bit 色深"
+            return "⚠️ 当前处于 YCbCr 色度压缩模式 (彩色边缘易产生轻微毛边) • 建议切换至 RGB 4:4:4"
         }
     }
 }
@@ -91,6 +99,8 @@ public final class ColorAndHardwareEngine: ObservableObject {
     @Published public var activeProfileURL: [CGDirectDisplayID: URL] = [:]
     @Published public var telemetry: [CGDirectDisplayID: DisplayHardwareTelemetryModel] = [:]
     @Published public var selectedBitDepth: [CGDirectDisplayID: BitDepthChoice] = [:]
+    @Published public var availableLinkModes: [CGDirectDisplayID: [DisplayOutputLinkMode]] = [:]
+    @Published public var currentLinkIndex: [CGDirectDisplayID: Int] = [:]
     @Published public var userSelectedHDR12Bit: [CGDirectDisplayID: Bool] = [:]
 
     // Hardware DDC RGB Gain (VCP 0x16 Red, 0x18 Green, 0x1A Blue)
@@ -120,8 +130,36 @@ public final class ColorAndHardwareEngine: ObservableObject {
             activeEOTF: Int(raw.activeEOTF),
             supportsHDR10EOTF: raw.supportsHDR10EOTF,
             supports12BitMode: raw.supports12BitMode,
-            supports10BitMode: raw.supports10BitMode
+            supports10BitMode: raw.supports10BitMode,
+            physicalWidthMM: raw.physicalWidthMM,
+            physicalHeightMM: raw.physicalHeightMM,
+            physicalDiagonalInches: raw.physicalDiagonalInches,
+            calculatedPPI: raw.calculatedPPI
         )
+
+        // Query all dynamic output link modes supported by this monitor
+        var linkItems = [MDP_LinkDescriptionItem](repeating: MDP_LinkDescriptionItem(), count: 16)
+        var curIdx: Int32 = -1
+        let count = MDP_GetDisplayOutputLinkDescriptions(displayID, &linkItems, 16, &curIdx)
+        if count > 0 {
+            var list: [DisplayOutputLinkMode] = []
+            for i in 0..<min(Int(count), 16) {
+                let it = linkItems[i]
+                list.append(DisplayOutputLinkMode(
+                    index: Int(it.index),
+                    bitDepth: Int(it.bitDepth),
+                    range: Int(it.range),
+                    eotf: Int(it.eotf),
+                    pixelEncoding: Int(it.pixelEncoding),
+                    isActive: it.isActive
+                ))
+            }
+            availableLinkModes[displayID] = list
+            currentLinkIndex[displayID] = Int(curIdx)
+        } else {
+            availableLinkModes[displayID] = []
+            currentLinkIndex[displayID] = nil
+        }
 
         if selectedBitDepth[displayID] == nil {
             let saved = UserDefaults.standard.integer(forKey: "mdp.bitDepth.\(displayID)")
@@ -132,24 +170,41 @@ public final class ColorAndHardwareEngine: ObservableObject {
         if blueGain[displayID] == nil { blueGain[displayID] = 100 }
     }
 
-    /// Directly activates Link Slot [1]: BitDepth=12, Range=0 (Limited 16-235), EOTF=2 (HDR10), Encoding=2 (YCbCr 4:2:2)
-    public func activateLinkSlot1_12BitHDR10(for displayID: CGDirectDisplayID) -> String {
-        userSelectedHDR12Bit[displayID] = true
-        let ok = MDP_SetExactLinkDescription(displayID, 12, 0, 2, 2)
+    /// Dynamically switches the active display output link to any supported link mode by its hardware index
+    public func switchLinkModeByIndex(for displayID: CGDirectDisplayID, index: Int) -> String {
+        let ok = MDP_SetDisplayOutputLinkByIndex(displayID, Int32(index))
         refresh(for: displayID)
-        return ok
-            ? "已强制开启 [1] 档：12-bit HDR10 (BitDepth=12, Range=0, EOTF=2, Encoding=2 YCbCr 4:2:2)"
-            : "切换 [1] 档失败，当前显示器不支持该硬件档位"
+        if let mode = availableLinkModes[displayID]?.first(where: { $0.index == index }) {
+            userSelectedHDR12Bit[displayID] = mode.isHDR
+            return ok
+                ? "已切换至硬件链路档位 \(mode.descriptionText)"
+                : "切换硬件链路档位 [\(index)] 失败"
+        }
+        return ok ? "已切换至硬件链路档位 [\(index)]" : "切换失败"
     }
 
-    /// Directly activates Link Slot [4]: BitDepth=8, Range=1 (Full 0-255), EOTF=0 (SDR), Encoding=0 (Pure RGB 4:4:4)
+    /// Automatically selects the best Pure RGB 4:4:4 Full Range link mode for this display
+    public func forceBestRGB444Mode(for displayID: CGDirectDisplayID) -> String {
+        userSelectedHDR12Bit[displayID] = false
+        if let rgbMode = availableLinkModes[displayID]?.first(where: { $0.pixelEncoding == 0 && $0.range == 1 && $0.eotf == 0 }) {
+            return switchLinkModeByIndex(for: displayID, index: rgbMode.index)
+        }
+        let ok = MDP_ForceRGB444FullRangeLink(displayID)
+        refresh(for: displayID)
+        return ok ? "已切换至纯正 RGB 4:4:4 全色度 + Full Range (0-255)" : "当前接口或显示器未提供 RGB 4:4:4 档位"
+    }
+
+    public func activateLinkSlot1_12BitHDR10(for displayID: CGDirectDisplayID) -> String {
+        userSelectedHDR12Bit[displayID] = true
+        if let hdrMode = availableLinkModes[displayID]?.first(where: { $0.isHDR || $0.bitDepth >= 12 }) {
+            return switchLinkModeByIndex(for: displayID, index: hdrMode.index)
+        }
+        return switchLinkModeByIndex(for: displayID, index: 1)
+    }
+
     public func activateLinkSlot4_RGB444FullRange(for displayID: CGDirectDisplayID) -> String {
         userSelectedHDR12Bit[displayID] = false
-        let ok = MDP_SetExactLinkDescription(displayID, 8, 1, 0, 0)
-        refresh(for: displayID)
-        return ok
-            ? "已恢复 [4] 档：8-bit Pure RGB 4:4:4 + Full Range (0-255, SDR 零毛边模式)"
-            : "切换 [4] 档失败"
+        return forceBestRGB444Mode(for: displayID)
     }
 
     public func selectBitDepth(_ choice: BitDepthChoice, for displayID: CGDirectDisplayID) -> String {
@@ -204,6 +259,11 @@ public final class ColorAndHardwareEngine: ObservableObject {
         }
 
         CGSetDisplayTransferByTable(displayID, UInt32(tableSize), &redTable, &greenTable, &blueTable)
+    }
+
+    /// Restores default linear ColorSync transfer curve and removes any custom LUT offsets
+    public func resetDisplayTransferTable(for displayID: CGDirectDisplayID) {
+        CGDisplayRestoreColorSyncSettings()
     }
 
     public func scanColorProfiles() {

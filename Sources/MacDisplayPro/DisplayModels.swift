@@ -52,6 +52,54 @@ public enum DDCInputSource: UInt16, CaseIterable, Identifiable {
     }
 }
 
+// MARK: - Hardware Link Mode Model
+public struct DisplayOutputLinkMode: Identifiable, Hashable {
+    public let index: Int
+    public let bitDepth: Int
+    public let range: Int           // 0=Limited (16-235), 1=Full (0-255)
+    public let eotf: Int            // 0=SDR, 2=HDR10 (PQ), 3=HLG
+    public let pixelEncoding: Int   // 0=RGB 4:4:4, 1=YCbCr 4:2:0, 2=YCbCr 4:2:2, 3=YCbCr
+    public let isActive: Bool
+
+    public var id: Int { index }
+
+    public var encodingText: String {
+        switch pixelEncoding {
+        case 0: return "RGB 4:4:4 全色度"
+        case 1: return "YCbCr 4:2:0"
+        case 2: return "YCbCr 4:2:2"
+        case 3: return "YCbCr 4:4:4"
+        default: return "Encoding \(pixelEncoding)"
+        }
+    }
+
+    public var rangeText: String {
+        range == 1 ? "Full (0-255)" : "Limited (16-235)"
+    }
+
+    public var eotfText: String {
+        switch eotf {
+        case 0: return "SDR Gamma"
+        case 2: return "HDR10 (ST.2084 PQ)"
+        case 3: return "HLG"
+        default: return "EOTF \(eotf)"
+        }
+    }
+
+    public var shortTitle: String {
+        "[\(index)] \(bitDepth)-bit • \(encodingText) • \(eotf == 2 ? "HDR10" : "SDR")"
+    }
+
+    public var isRGB444: Bool { pixelEncoding == 0 }
+    public var isFullRange: Bool { range == 1 }
+    public var isHDR: Bool { eotf == 2 || eotf == 3 }
+    public var summaryText: String { descriptionText }
+
+    public var descriptionText: String {
+        "[\(index)] \(bitDepth)-bit • \(encodingText) • \(rangeText) • \(eotfText)"
+    }
+}
+
 // MARK: - Resolution Mode Model
 public struct DisplayResolutionMode: Identifiable, Hashable {
     public let id: String
@@ -63,8 +111,37 @@ public struct DisplayResolutionMode: Identifiable, Hashable {
     public let refreshRate: Double
     public let isHiDPI: Bool
     public let isCurrent: Bool
+    public let isVRR: Bool
     public let cgsModeNumber: Int32?
     public let cgDisplayMode: CGDisplayMode?
+
+    public init(
+        id: String,
+        displayID: CGDirectDisplayID,
+        width: Int,
+        height: Int,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        refreshRate: Double,
+        isHiDPI: Bool,
+        isCurrent: Bool,
+        isVRR: Bool = false,
+        cgsModeNumber: Int32? = nil,
+        cgDisplayMode: CGDisplayMode? = nil
+    ) {
+        self.id = id
+        self.displayID = displayID
+        self.width = width
+        self.height = height
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.refreshRate = refreshRate
+        self.isHiDPI = isHiDPI
+        self.isCurrent = isCurrent
+        self.isVRR = isVRR
+        self.cgsModeNumber = cgsModeNumber
+        self.cgDisplayMode = cgDisplayMode
+    }
 
     public var resolutionText: String {
         "\(width) × \(height)"
@@ -175,5 +252,12 @@ public struct ManagedDisplay: Identifiable {
 
     public var supportsXDRBoost: Bool {
         maxPotentialEDR > 1.05
+    }
+
+    public var persistentKey: String {
+        if isVirtual {
+            return "VIRT-\(vendorHex)-\(modelHex)-\(name)"
+        }
+        return String(format: "%04X-%04X-%u", vendorID, modelID, serialNumber)
     }
 }

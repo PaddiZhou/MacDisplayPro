@@ -9,12 +9,18 @@ public struct MenuBarPopoverView: View {
     var onOpenStudio: () -> Void
 
     public init(
-        store: DisplayStore = .shared,
-        virtualManager: VirtualDisplayManager = .shared,
+        store: DisplayStore,
+        virtualManager: VirtualDisplayManager,
         onOpenStudio: @escaping () -> Void
     ) {
         self.store = store
         self.virtualManager = virtualManager
+        self.onOpenStudio = onOpenStudio
+    }
+
+    public init(onOpenStudio: @escaping () -> Void) {
+        self.store = .shared
+        self.virtualManager = .shared
         self.onOpenStudio = onOpenStudio
     }
 
@@ -230,7 +236,7 @@ public struct MenuBarPopoverView: View {
                     let quickModes = disp.hiDPIModes.isEmpty ? Array(disp.loDPIModes.prefix(4)) : Array(disp.hiDPIModes.prefix(4))
                     LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 6) {
                         ForEach(quickModes) { mode in
-                            let isFav = (mode.width == 2048 && mode.height == 1152)
+                            let isFav = store.isFavoriteMode(mode, for: disp)
                             Button(action: { store.switchResolution(mode) }) {
                                 HStack(spacing: 4) {
                                     if isFav {

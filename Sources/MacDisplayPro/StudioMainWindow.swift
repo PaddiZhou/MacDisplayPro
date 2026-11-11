@@ -227,8 +227,8 @@ public struct StudioMainView: View {
                             .padding(.horizontal, 7)
                             .padding(.vertical, 2)
                             .background(Capsule().fill(Color.secondary.opacity(0.15)))
-                        if disp.currentMode?.width == 1920 && disp.currentMode?.height == 1080 && (disp.currentMode?.isHiDPI ?? false) {
-                            Label("最爱默认 (点对点 4K) 已生效", systemImage: "star.fill")
+                        if let cur = disp.currentMode, store.isFavoriteMode(cur, for: disp) {
+                            Label("常用默认 (\(cur.resolutionText)) 已生效", systemImage: "star.fill")
                                 .font(.system(size: 10.5, weight: .bold))
                                 .padding(.horizontal, 8)
                                 .padding(.vertical, 2.5)
@@ -285,12 +285,18 @@ public struct StudioMainView: View {
 
             // 4 Live Hardware Telemetry Metric Cards
             HStack(spacing: 10) {
+                let ppiDetail: String = {
+                    if let tel = colorEngine.telemetry[disp.id], tel.calculatedPPI > 10 {
+                        return "\(String(format: "%.1f", tel.physicalDiagonalInches)) 吋 • \(Int(tel.calculatedPPI)) PPI"
+                    }
+                    return "比例 \(disp.currentMode?.aspectRatioText ?? "16:9") @ \(disp.currentMode?.refreshRateText ?? "60 Hz")"
+                }()
                 MetricBadgeCard(
                     icon: "viewfinder",
                     tint: .indigo,
                     label: "当前逻辑分辨率",
                     value: disp.currentMode?.resolutionText ?? "2048 × 1152",
-                    detail: "比例 \(disp.currentMode?.aspectRatioText ?? "16:9") @ \(disp.currentMode?.refreshRateText ?? "60 Hz")"
+                    detail: ppiDetail
                 )
                 MetricBadgeCard(
                     icon: "square.stack.3d.up.fill",
@@ -384,20 +390,21 @@ public struct StudioMainView: View {
         // 2. Visual HiDPI Scale Grid
         ProCard(
             title: "HiDPI 2x 视网膜缩放快速切换面板",
-            subtitle: "所有档位均严格校验双倍像素帧缓冲 (backingScaleFactor = 2.0)，带有 ★ 星标的为你锁定的 1920×1080 点对点 4K 最爱默认项",
+            subtitle: "所有档位均严格校验双倍像素帧缓冲 (backingScaleFactor = 2.0)，点击卡片右上角 ★ 星标可将任意分辨率设为当前屏幕的常用默认项",
             icon: "viewfinder",
             iconColor: .blue,
             badgeText: "\(disp.hiDPIModes.count) 个 2x Retina 档位"
         ) {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 ForEach(disp.hiDPIModes.prefix(9)) { mode in
-                    let isFav = (mode.width == 1920 && mode.height == 1080)
-                    let tag: String? = isFav ? "最爱默认 • 零插值点对点" : (mode.width == 2048 ? "1.07x 黄金大视野" : (mode.width == 2304 ? "1.2x 均衡视野" : (mode.width == 2560 ? "5K 大视野" : nil)))
+                    let isFav = store.isFavoriteMode(mode, for: disp)
+                    let tag: String? = isFav ? "常用默认" : (mode.width == 2048 ? "1.07x 黄金大视野" : (mode.width == 2304 ? "1.2x 均衡视野" : (mode.width == 2560 ? "5K 大视野" : nil)))
                     ResolutionScaleCard(
                         mode: mode,
                         isFavoriteDefault: isFav,
                         tagLabel: tag,
-                        onSelect: { store.switchResolution(mode) }
+                        onSelect: { store.switchResolution(mode) },
+                        onToggleFavorite: { store.toggleFavoriteMode(mode, for: disp) }
                     )
                 }
             }
@@ -515,12 +522,13 @@ public struct StudioMainView: View {
         ) {
             LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
                 ForEach(disp.hiDPIModes) { mode in
-                    let isFav = (mode.width == 1920 && mode.height == 1080)
+                    let isFav = store.isFavoriteMode(mode, for: disp)
                     ResolutionScaleCard(
                         mode: mode,
                         isFavoriteDefault: isFav,
-                        tagLabel: isFav ? "最爱默认 • 点对点 4K" : nil,
-                        onSelect: { store.switchResolution(mode) }
+                        tagLabel: isFav ? "常用默认" : nil,
+                        onSelect: { store.switchResolution(mode) },
+                        onToggleFavorite: { store.toggleFavoriteMode(mode, for: disp) }
                     )
                 }
             }
@@ -668,6 +676,12 @@ public struct StudioMainView: View {
                             .buttonStyle(.borderedProminent)
                         Button("145% HDR 提亮") { store.setXDRLuminance(for: disp.id, factor: 1.45) }
                         Button("190% XDR 超亮") { store.setXDRLuminance(for: disp.id, factor: 1.90) }
+                        Button("重置 LUT") {
+                            colorEngine.resetDisplayTransferTable(for: disp.id)
+                            store.xdrLuminanceFactor[disp.id] = 1.0
+                            store.warmthFactor[disp.id] = 0.0
+                            store.statusMessage = "已重置 GPU 硬件 LUT 伽马表至系统原生默认"
+                        }
                     }
                     .controlSize(.small)
 
@@ -858,39 +872,125 @@ public struct StudioMainView: View {
                                 )
                         }
 
-                        // Direct HDMI Hardware Link Slot Selector ([1] 12-bit HDR10 vs [4] 8-bit RGB 4:4:4 Full Range)
+                        // Dynamic Display Output Link Descriptions & Hardware Slot Switcher
                         Divider()
-                        VStack(alignment: .leading, spacing: 6) {
-                            let tel = colorEngine.telemetry[disp.id]
-                            let isSlot1 = (tel?.activeLinkBitDepth == 12 && tel?.activeEOTF == 2)
-                            let isSlot4 = (tel?.activePixelEncoding == 0 && tel?.activeDynamicRange == 1 && tel?.activeEOTF == 0)
-                            Text("HDMI 底层硬件信号档位直选 (绕过系统设置限制):")
-                                .font(.system(size: 10.5, weight: .bold))
-                                .foregroundColor(.secondary)
-                            HStack(spacing: 8) {
-                                Button(action: {
-                                    let msg = colorEngine.activateLinkSlot1_12BitHDR10(for: disp.id)
-                                    store.statusMessage = msg
-                                    HUDManager.shared.show(icon: "sparkles.tv.fill", title: "已开启 [1] 12-bit HDR10", subtitle: "EOTF=2 • YCbCr 4:2:2 • Limited", tint: .purple)
-                                }) {
-                                    Label(isSlot1 ? "✅ [1] 12-bit HDR10 (YCbCr 4:2:2) 已激活" : "开启 [1] 12-bit HDR10 (YCbCr 4:2:2)", systemImage: "bolt.horizontal.fill")
-                                        .font(.system(size: 11, weight: .semibold))
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .tint(isSlot1 ? .purple : .secondary)
-                                .controlSize(.small)
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack {
+                                Text("底层输出硬件链路模式 (Display Output Link):")
+                                    .font(.system(size: 11, weight: .bold))
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Toggle("SDR 模式自动锁定 RGB 4:4:4", isOn: Binding(
+                                    get: { store.isAutoGuardRGB444Enabled(for: disp) },
+                                    set: { store.setAutoGuardRGB444(for: disp, enabled: $0) }
+                                ))
+                                .toggleStyle(.checkbox)
+                                .font(.system(size: 10.5))
+                            }
 
-                                Button(action: {
-                                    let msg = colorEngine.activateLinkSlot4_RGB444FullRange(for: disp.id)
-                                    store.statusMessage = msg
-                                    HUDManager.shared.show(icon: "checkmark.shield.fill", title: "已恢复 [4] Pure RGB 4:4:4", subtitle: "Full Range 0-255 • SDR 零毛边", tint: .green)
-                                }) {
-                                    Label(isSlot4 ? "✅ [4] Pure RGB 4:4:4 Full (SDR) 已激活" : "恢复 [4] Pure RGB 4:4:4 (SDR 零毛边)", systemImage: "display")
-                                        .font(.system(size: 11, weight: .semibold))
+                            if let linkModes = colorEngine.availableLinkModes[disp.id], !linkModes.isEmpty {
+                                VStack(spacing: 5) {
+                                    ForEach(linkModes) { lMode in
+                                        HStack(spacing: 8) {
+                                            Text("[\(lMode.index)]")
+                                                .font(.system(size: 10.5, weight: .bold, design: .monospaced))
+                                                .foregroundColor(.secondary)
+                                                .frame(width: 24, alignment: .leading)
+
+                                            VStack(alignment: .leading, spacing: 1) {
+                                                HStack(spacing: 5) {
+                                                    Text("\(lMode.bitDepth)-Bit \(lMode.encodingText)")
+                                                        .font(.system(size: 11, weight: .bold))
+                                                    Text(lMode.rangeText)
+                                                        .font(.system(size: 9.5, weight: .medium, design: .monospaced))
+                                                        .padding(.horizontal, 4)
+                                                        .padding(.vertical, 1)
+                                                        .background(Color.secondary.opacity(0.12))
+                                                        .cornerRadius(3)
+                                                    Text(lMode.eotfText)
+                                                        .font(.system(size: 9.5, weight: .bold))
+                                                        .padding(.horizontal, 4)
+                                                        .padding(.vertical, 1)
+                                                        .background(lMode.isHDR ? Color.purple.opacity(0.18) : Color.blue.opacity(0.15))
+                                                        .foregroundColor(lMode.isHDR ? .purple : .blue)
+                                                        .cornerRadius(3)
+                                                    if lMode.isRGB444 && lMode.isFullRange {
+                                                        Text("高保真零毛边")
+                                                            .font(.system(size: 9, weight: .bold))
+                                                            .padding(.horizontal, 4)
+                                                            .padding(.vertical, 1)
+                                                            .background(Color.green.opacity(0.18))
+                                                            .foregroundColor(.green)
+                                                            .cornerRadius(3)
+                                                    }
+                                                }
+                                            }
+
+                                            Spacer()
+
+                                            if lMode.isActive {
+                                                Label("当前生效", systemImage: "checkmark.circle.fill")
+                                                    .font(.system(size: 10.5, weight: .bold))
+                                                    .foregroundColor(.green)
+                                            } else {
+                                                Button("应用") {
+                                                    let res = colorEngine.switchLinkModeByIndex(for: disp.id, index: lMode.index)
+                                                    store.statusMessage = res
+                                                    HUDManager.shared.show(
+                                                        icon: "display",
+                                                        title: "已切换链路 [\(lMode.index)]",
+                                                        subtitle: lMode.summaryText,
+                                                        tint: lMode.isRGB444 ? .green : .purple
+                                                    )
+                                                }
+                                                .buttonStyle(.bordered)
+                                                .controlSize(.mini)
+                                            }
+                                        }
+                                        .padding(.horizontal, 8)
+                                        .padding(.vertical, 4)
+                                        .background(RoundedRectangle(cornerRadius: 6).fill(lMode.isActive ? Color.green.opacity(0.08) : Color.secondary.opacity(0.04)))
+                                    }
                                 }
-                                .buttonStyle(.borderedProminent)
-                                .tint(isSlot4 ? .green : .secondary)
+                            } else {
+                                let tel = colorEngine.telemetry[disp.id]
+                                let isSlot1 = (tel?.activeLinkBitDepth == 12 && tel?.activeEOTF == 2)
+                                let isSlot4 = (tel?.activePixelEncoding == 0 && tel?.activeDynamicRange == 1 && tel?.activeEOTF == 0)
+                                HStack(spacing: 8) {
+                                    Button(action: {
+                                        let msg = colorEngine.activateLinkSlot1_12BitHDR10(for: disp.id)
+                                        store.statusMessage = msg
+                                        HUDManager.shared.show(icon: "sparkles.tv.fill", title: "已开启 [1] 12-bit HDR10", subtitle: "EOTF=2 • YCbCr 4:2:2 • Limited", tint: .purple)
+                                    }) {
+                                        Label(isSlot1 ? "✅ [1] 12-bit HDR10 已激活" : "开启 [1] 12-bit HDR10", systemImage: "bolt.horizontal.fill")
+                                            .font(.system(size: 11, weight: .semibold))
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(isSlot1 ? .purple : .secondary)
+                                    .controlSize(.small)
+
+                                    Button(action: {
+                                        let msg = colorEngine.activateLinkSlot4_RGB444FullRange(for: disp.id)
+                                        store.statusMessage = msg
+                                        HUDManager.shared.show(icon: "checkmark.shield.fill", title: "已恢复 [4] Pure RGB 4:4:4", subtitle: "Full Range 0-255 • SDR 零毛边", tint: .green)
+                                    }) {
+                                        Label(isSlot4 ? "✅ [4] Pure RGB 4:4:4 已激活" : "恢复 [4] Pure RGB 4:4:4", systemImage: "display")
+                                            .font(.system(size: 11, weight: .semibold))
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(isSlot4 ? .green : .secondary)
+                                    .controlSize(.small)
+                                }
+                            }
+
+                            HStack {
+                                Button("重置色彩与伽马查找表 (恢复 ColorSync 默认)") {
+                                    colorEngine.resetDisplayTransferTable(for: disp.id)
+                                    store.statusMessage = "已重置色彩查找表并恢复 ColorSync 原生伽马"
+                                }
+                                .buttonStyle(.bordered)
                                 .controlSize(.small)
+                                Spacer()
                             }
                         }
                     }
@@ -977,6 +1077,14 @@ public struct StudioMainView: View {
                         iconOptimizer.alignDockToHarmonicPixelGrid(tileSizePt: 64)
                         iconOptimizer.rebuildRetinaIconAndDockCache()
                         store.statusMessage = "已锁定 Dock 图标为 64pt (128px @2x → 120.0 整数物理像素，零初次缩放)"
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+
+                    Button("恢复系统默认 Dock") {
+                        iconOptimizer.restoreDefaultDockPreferences()
+                        store.statusMessage = "已清除 Dock 图标尺寸覆盖，恢复 macOS 系统默认"
+                        HUDManager.shared.show(icon: "arrow.counterclockwise", title: "Dock 恢复默认", subtitle: "已重置为系统默认配置", tint: .teal)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)

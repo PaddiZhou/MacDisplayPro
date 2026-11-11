@@ -127,8 +127,10 @@ echo "==> 4. Signing MacDisplayPro.app (ad-hoc signature for local execution)...
 codesign --force --deep --sign - "$APP_DIR"
 xattr -cr "$APP_DIR" 2>/dev/null || true
 
-echo "==> 5. Creating portable Universal Binary archive for easy transfer to Intel/Apple Silicon Macs..."
-ditto -c -k --keepParent "$APP_DIR" "$PROJECT_DIR/MacDisplayPro-Universal-Portable.zip"
+echo "==> 5. Creating portable Universal Binary archive (v2.0.0)..."
+ZIP_NAME="MacDisplayPro-v2.0.0-Universal.zip"
+rm -f "$PROJECT_DIR/$ZIP_NAME"
+ditto -c -k --keepParent "$APP_DIR" "$PROJECT_DIR/$ZIP_NAME"
 
 echo "==> Done! App bundle created at: $APP_DIR"
-echo "==> Portable Zip created at: $PROJECT_DIR/MacDisplayPro-Universal-Portable.zip"
+echo "==> Portable Universal Zip created at: $PROJECT_DIR/$ZIP_NAME"

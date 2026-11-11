@@ -751,6 +751,106 @@ bool MDP_SetExactLinkDescription(CGDirectDisplayID displayID, uint32_t bitDepth,
     return (setOut(displayID, x1, x2) == 0);
 }
 
+int32_t MDP_GetDisplayOutputLinkDescriptions(CGDirectDisplayID displayID, MDP_LinkDescriptionItem *outItems, int32_t maxItems, int32_t *outCurrentIndex) {
+    if (outCurrentIndex) *outCurrentIndex = -1;
+    if (CGDisplayIsBuiltin(displayID)) return 0;
+    void *h = MDP_GetSkyLightHandle();
+    if (!h) return 0;
+
+    static SLSGetDisplayOutputModeLinkDescriptionsFunc getLinks = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        getLinks = (SLSGetDisplayOutputModeLinkDescriptionsFunc)dlsym(h, "SLSGetDisplayOutputModeLinkDescriptions");
+    });
+    if (!getLinks) return 0;
+
+    int32_t curModeNum = MDP_GetCurrentDisplayModeNumber(displayID);
+    if (curModeNum < 0) return 0;
+
+    uint32_t buf[64];
+    memset(buf, 0, sizeof(buf));
+    int32_t ioCount = 16;
+    int32_t currentIdx = -1;
+    if (getLinks(displayID, curModeNum, buf, &ioCount, &currentIdx) != 0 || ioCount <= 0) {
+        return 0;
+    }
+
+    if (outCurrentIndex) *outCurrentIndex = currentIdx;
+    int32_t copyCount = (ioCount < maxItems) ? ioCount : maxItems;
+    if (outItems && copyCount > 0) {
+        for (int i = 0; i < copyCount; i++) {
+            outItems[i].index = i;
+            outItems[i].bitDepth = buf[i * 4 + 0];
+            outItems[i].range = buf[i * 4 + 1];
+            outItems[i].eotf = buf[i * 4 + 2];
+            outItems[i].pixelEncoding = buf[i * 4 + 3];
+            outItems[i].isActive = (i == currentIdx);
+        }
+    }
+    return ioCount;
+}
+
+bool MDP_SetDisplayOutputLinkByIndex(CGDirectDisplayID displayID, int32_t index) {
+    if (index < 0) return false;
+    if (CGDisplayIsBuiltin(displayID)) return true;
+    void *h = MDP_GetSkyLightHandle();
+    if (!h) return false;
+
+    static SLSGetDisplayOutputModeLinkDescriptionsFunc getLinks = NULL;
+    static SLSSetDisplayOutputModeFunc setOut = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        getLinks = (SLSGetDisplayOutputModeLinkDescriptionsFunc)dlsym(h, "SLSGetDisplayOutputModeLinkDescriptions");
+        setOut = (SLSSetDisplayOutputModeFunc)dlsym(h, "SLSSetDisplayOutputMode");
+    });
+    if (!getLinks || !setOut) return false;
+
+    int32_t curModeNum = MDP_GetCurrentDisplayModeNumber(displayID);
+    if (curModeNum < 0) return false;
+
+    uint32_t buf[64];
+    memset(buf, 0, sizeof(buf));
+    int32_t ioCount = 16;
+    int32_t currentIdx = -1;
+    if (getLinks(displayID, curModeNum, buf, &ioCount, &currentIdx) != 0 || ioCount <= 0) {
+        return false;
+    }
+    if (index >= ioCount) return false;
+
+    uint32_t bpc   = buf[index * 4 + 0];
+    uint32_t range = buf[index * 4 + 1];
+    uint32_t eotf  = buf[index * 4 + 2];
+    uint32_t enc   = buf[index * 4 + 3];
+
+    uint64_t x1 = (uint64_t)bpc  | ((uint64_t)range << 32);
+    uint64_t x2 = (uint64_t)eotf | ((uint64_t)enc << 32);
+    return (setOut(displayID, x1, x2) == 0);
+}
+
+void MDP_GetDisplayPhysicalMetrics(CGDirectDisplayID displayID, double *outWidthMM, double *outHeightMM, double *outDiagonalInches, double *outPPI) {
+    CGSize sizeMM = CGDisplayScreenSize(displayID);
+    double wMM = sizeMM.width;
+    double hMM = sizeMM.height;
+    double diagIn = 0.0;
+    double ppi = 0.0;
+
+    if (wMM > 1.0 && hMM > 1.0) {
+        double diagMM = sqrt(wMM * wMM + hMM * hMM);
+        diagIn = diagMM / 25.4;
+        size_t pxW = CGDisplayPixelsWide(displayID);
+        size_t pxH = CGDisplayPixelsHigh(displayID);
+        double diagPx = sqrt((double)(pxW * pxW + pxH * pxH));
+        if (diagIn > 0.1) {
+            ppi = diagPx / diagIn;
+        }
+    }
+
+    if (outWidthMM) *outWidthMM = wMM;
+    if (outHeightMM) *outHeightMM = hMM;
+    if (outDiagonalInches) *outDiagonalInches = diagIn;
+    if (outPPI) *outPPI = ppi;
+}
+
 MDP_HardwareTelemetry MDP_GetDisplayHardwareTelemetry(CGDirectDisplayID displayID) {
     MDP_HardwareTelemetry info;
     memset(&info, 0, sizeof(info));
@@ -762,6 +862,9 @@ MDP_HardwareTelemetry MDP_GetDisplayHardwareTelemetry(CGDirectDisplayID displayI
     info.activePixelEncoding = 0;
     info.activeDynamicRange = 1;
     info.supports10BitMode = true;
+
+    // Physical metrics calculation
+    MDP_GetDisplayPhysicalMetrics(displayID, &info.physicalWidthMM, &info.physicalHeightMM, &info.physicalDiagonalInches, &info.calculatedPPI);
 
     // 1. Check current CGS Mode depth & active SkyLight LinkDescription
     int32_t curModeNum = MDP_GetCurrentDisplayModeNumber(displayID);
@@ -797,54 +900,80 @@ MDP_HardwareTelemetry MDP_GetDisplayHardwareTelemetry(CGDirectDisplayID displayI
         }
     }
 
-    // 2. Traverse IOMobileFramebufferAP / IORegistry for DisplayHints & TimingElements
+    // 2. Target display identification to prevent cross-display overwriting in multi-monitor setups
+    uint32_t targetVendor = CGDisplayVendorNumber(displayID);
+    uint32_t targetModel = CGDisplayModelNumber(displayID);
+
     io_iterator_t iter = IO_OBJECT_NULL;
     if (IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("IOMobileFramebufferAP"), &iter) == KERN_SUCCESS && iter != IO_OBJECT_NULL) {
         io_service_t serv = IO_OBJECT_NULL;
+        bool foundExactMatch = false;
+
         while ((serv = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
-            CFTypeRef hintsRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("DisplayHints"), kCFAllocatorDefault, kIORegistryIterateRecursively);
-            if (hintsRef && CFGetTypeID(hintsRef) == CFDictionaryGetTypeID()) {
-                NSDictionary *hints = (__bridge NSDictionary *)hintsRef;
-                NSNumber *bpc = hints[@"MaxBpc"];
-                NSNumber *rate = hints[@"MaxTotalPixelRate"];
-                if (bpc) {
-                    info.maxBpc = bpc.unsignedIntValue;
-                    if (info.maxBpc >= 12) info.supports12BitMode = true;
-                }
-                if (rate && rate.unsignedIntValue > 0) {
-                    info.maxPixelRateMHz = rate.unsignedIntValue / 1000000;
-                }
-            }
-            if (hintsRef) CFRelease(hintsRef);
-
-            CFTypeRef maxSrcRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("IOMFBMaxSrcPixels"), kCFAllocatorDefault, kIORegistryIterateRecursively);
-            if (maxSrcRef && CFGetTypeID(maxSrcRef) == CFDictionaryGetTypeID()) {
-                NSDictionary *maxSrc = (__bridge NSDictionary *)maxSrcRef;
-                NSNumber *maxW = maxSrc[@"MaxSrcBufferWidth"];
-                if (maxW) info.maxGPUSrcBufferWidth = maxW.unsignedIntValue;
-            }
-            if (maxSrcRef) CFRelease(maxSrcRef);
-
-            CFTypeRef timingRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("TimingElements"), kCFAllocatorDefault, kIORegistryIterateRecursively);
-            if (timingRef && CFGetTypeID(timingRef) == CFArrayGetTypeID()) {
-                NSArray *timings = (__bridge NSArray *)timingRef;
-                for (NSDictionary *elem in timings) {
-                    if (![elem isKindOfClass:[NSDictionary class]]) continue;
-                    NSArray *colorModes = elem[@"ColorModes"];
-                    if (![colorModes isKindOfClass:[NSArray class]]) continue;
-                    for (NSDictionary *cm in colorModes) {
-                        if (![cm isKindOfClass:[NSDictionary class]]) continue;
-                        NSNumber *depth = cm[@"Depth"];
-                        NSNumber *eotf = cm[@"EOTF"];
-                        if (depth.intValue >= 12) info.supports12BitMode = true;
-                        if (depth.intValue >= 10) info.supports10BitMode = true;
-                        if (eotf.intValue == 2) info.supportsHDR10EOTF = true;
+            // Check if this framebuffer service belongs to the requested display
+            bool isTargetService = false;
+            CFTypeRef attrsRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("DisplayAttributes"), kCFAllocatorDefault, kIORegistryIterateRecursively);
+            if (attrsRef && CFGetTypeID(attrsRef) == CFDictionaryGetTypeID()) {
+                NSDictionary *attrs = (__bridge NSDictionary *)attrsRef;
+                NSDictionary *prod = attrs[@"ProductAttributes"];
+                if ([prod isKindOfClass:[NSDictionary class]]) {
+                    NSNumber *pid = prod[@"ProductID"];
+                    NSNumber *legacyMfr = prod[@"LegacyManufacturerID"];
+                    if (pid && legacyMfr && pid.unsignedIntValue == targetModel && legacyMfr.unsignedIntValue == targetVendor) {
+                        isTargetService = true;
+                        foundExactMatch = true;
                     }
                 }
             }
-            if (timingRef) CFRelease(timingRef);
+            if (attrsRef) CFRelease(attrsRef);
+
+            // If we have not matched specifically yet or this is the exact match, extract hints
+            if (isTargetService || !foundExactMatch) {
+                CFTypeRef hintsRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("DisplayHints"), kCFAllocatorDefault, kIORegistryIterateRecursively);
+                if (hintsRef && CFGetTypeID(hintsRef) == CFDictionaryGetTypeID()) {
+                    NSDictionary *hints = (__bridge NSDictionary *)hintsRef;
+                    NSNumber *bpc = hints[@"MaxBpc"];
+                    NSNumber *rate = hints[@"MaxTotalPixelRate"];
+                    if (bpc && bpc.unsignedIntValue > 0) {
+                        info.maxBpc = bpc.unsignedIntValue;
+                        if (info.maxBpc >= 12) info.supports12BitMode = true;
+                    }
+                    if (rate && rate.unsignedIntValue > 0) {
+                        info.maxPixelRateMHz = rate.unsignedIntValue / 1000000;
+                    }
+                }
+                if (hintsRef) CFRelease(hintsRef);
+
+                CFTypeRef maxSrcRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("IOMFBMaxSrcPixels"), kCFAllocatorDefault, kIORegistryIterateRecursively);
+                if (maxSrcRef && CFGetTypeID(maxSrcRef) == CFDictionaryGetTypeID()) {
+                    NSDictionary *maxSrc = (__bridge NSDictionary *)maxSrcRef;
+                    NSNumber *maxW = maxSrc[@"MaxSrcBufferWidth"];
+                    if (maxW) info.maxGPUSrcBufferWidth = maxW.unsignedIntValue;
+                }
+                if (maxSrcRef) CFRelease(maxSrcRef);
+
+                CFTypeRef timingRef = IORegistryEntrySearchCFProperty(serv, kIOServicePlane, CFSTR("TimingElements"), kCFAllocatorDefault, kIORegistryIterateRecursively);
+                if (timingRef && CFGetTypeID(timingRef) == CFArrayGetTypeID()) {
+                    NSArray *timings = (__bridge NSArray *)timingRef;
+                    for (NSDictionary *elem in timings) {
+                        if (![elem isKindOfClass:[NSDictionary class]]) continue;
+                        NSArray *colorModes = elem[@"ColorModes"];
+                        if (![colorModes isKindOfClass:[NSArray class]]) continue;
+                        for (NSDictionary *cm in colorModes) {
+                            if (![cm isKindOfClass:[NSDictionary class]]) continue;
+                            NSNumber *depth = cm[@"Depth"];
+                            NSNumber *eotf = cm[@"EOTF"];
+                            if (depth.intValue >= 12) info.supports12BitMode = true;
+                            if (depth.intValue >= 10) info.supports10BitMode = true;
+                            if (eotf.intValue == 2) info.supportsHDR10EOTF = true;
+                        }
+                    }
+                }
+                if (timingRef) CFRelease(timingRef);
+            }
 
             IOObjectRelease(serv);
+            if (foundExactMatch) break;
         }
         IOObjectRelease(iter);
     }
@@ -958,7 +1087,7 @@ bool MDP_SetDisplayColorProfileURL(CGDirectDisplayID displayID, NSURL * _Nullabl
         }
     }
 
-    CFTypeRef val = profileURL ? (__bridge CFURLRef)profileURL : kCFNull;
+    CFTypeRef val = profileURL ? (__bridge CFTypeRef)profileURL : (CFTypeRef)kCFNull;
     NSDictionary *customDict = @{
         defID: (__bridge id)val,
         (__bridge NSString *)kColorSyncProfileUserScope: (__bridge id)kCFPreferencesCurrentUser
