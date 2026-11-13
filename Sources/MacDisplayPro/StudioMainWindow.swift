@@ -1023,9 +1023,9 @@ public struct StudioMainView: View {
                             Text("\(Int(b))").font(.system(size: 11, design: .monospaced)).frame(width: 30)
                         }
                         HStack(spacing: 8) {
-                            Button("6500K D65 标准") { colorEngine.setHardwareRGBGain(for: disp.id, r: 100, g: 100, b: 100) }
-                            Button("7500K 通透冷白") { colorEngine.setHardwareRGBGain(for: disp.id, r: 94, g: 97, b: 100) }
-                            Button("5800K 柔和原彩") { colorEngine.setHardwareRGBGain(for: disp.id, r: 100, g: 96, b: 88) }
+                            Button("6500K D65 标准") { colorEngine.setHardwareRGBGain(for: disp.id, r: 100, g: 100, b: 100, force: true) }
+                            Button("7500K 通透冷白") { colorEngine.setHardwareRGBGain(for: disp.id, r: 94, g: 97, b: 100, force: true) }
+                            Button("5800K 柔和原彩") { colorEngine.setHardwareRGBGain(for: disp.id, r: 100, g: 96, b: 88, force: true) }
                         }
                         .controlSize(.small)
                     }

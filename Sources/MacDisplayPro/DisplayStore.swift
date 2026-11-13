@@ -148,14 +148,9 @@ public final class DisplayStore: ObservableObject {
                 return
             }
 
-            // 3. Sync Apple Native Brightness (Built-in Retina / Apple Studio Display / DisplayServices)
-            if let nativeB = DDCController.shared.getNativeBrightness(displayID: id) {
-                let pct = Double((nativeB * 100.0).rounded())
-                if abs((ddcBrightness[id] ?? 80.0) - pct) >= 1.0 {
-                    ddcBrightness[id] = pct
-                }
-            } else if disp.supportsDDC {
-                // 4. Sync External Monitor Hardware DDC Brightness (0x10), Contrast (0x12), Volume (0x62) in rotation
+            // 3. Prefer DDC/CI on external DDC monitors; fall back to Apple Native Brightness for Built-in / Apple Displays
+            if disp.supportsDDC {
+                // Sync External Monitor Hardware DDC Brightness (0x10), Contrast (0x12), Volume (0x62) in rotation
                 // Reading VCP (0x01) only reads from the monitor controller and causes ZERO EEPROM write wear.
                 let codeToRead: DDCCode
                 switch ddcPollCycle % 3 {
@@ -186,6 +181,11 @@ public final class DisplayStore: ObservableObject {
                             break
                         }
                     }
+                }
+            } else if let nativeB = DDCController.shared.getNativeBrightness(displayID: id) {
+                let pct = Double((nativeB * 100.0).rounded())
+                if abs((ddcBrightness[id] ?? 80.0) - pct) >= 1.0 {
+                    ddcBrightness[id] = pct
                 }
             }
         }
@@ -247,7 +247,7 @@ public final class DisplayStore: ObservableObject {
 
             // Initialize state defaults if not yet populated
             if ddcBrightness[id] == nil {
-                if let nativeB = DDCController.shared.getNativeBrightness(displayID: id) {
+                if !ddcSupported, let nativeB = DDCController.shared.getNativeBrightness(displayID: id) {
                     ddcBrightness[id] = Double(nativeB * 100.0)
                 } else {
                     ddcBrightness[id] = profile.recommendedBrightness
@@ -450,39 +450,71 @@ public final class DisplayStore: ObservableObject {
     public func applySmartScene(_ scene: SmartScenePreset, for displayID: CGDirectDisplayID) {
         guard let disp = displays.first(where: { $0.id == displayID }) else { return }
 
-        // 1. Switch to scene's target HiDPI resolution if not already active
-        if let targetMode = disp.hiDPIModes.first(where: { abs($0.width - scene.targetWidth) <= 16 }), !targetMode.isCurrent {
-            _ = HiDPIManager.shared.applyResolutionMode(targetMode)
+        // Pause background DDC read polling and clear stale DDC write cache so every scene register applies cleanly
+        lastUserWriteTime = Date()
+        DDCController.shared.invalidateCache(for: displayID)
+
+        // 1. Persist scene's target HiDPI resolution BEFORE switching so screen-change auto-adapt does not revert it
+        var didSwitchResolution = false
+        if let targetMode = disp.hiDPIModes
+            .filter({ abs($0.width - scene.targetWidth) <= 16 })
+            .sorted(by: { $0.refreshRate > $1.refreshRate })
+            .first {
+            let displayKey = smartProfiles[displayID]?.displayIdentifierKey ?? disp.persistentKey
+            AutoAdaptEngine.shared.saveUserResolutionPreference(displayKey: displayKey, modeID: targetMode.id)
+            if !targetMode.isCurrent {
+                didSwitchResolution = HiDPIManager.shared.applyResolutionMode(targetMode)
+            }
         }
 
-        // 2. Apply DDC brightness & contrast
-        setHardwareBrightness(for: displayID, value: scene.brightness)
-        setHardwareContrast(for: displayID, value: scene.contrast)
+        // 2. Exit 12-bit HDR link override, enforce 16-bit FP16 preference, and lock Pure RGB 4:4:4 Full Range via Dynamic Link Matrix
+        let hasCustomXDRWarmth = abs(scene.xdrFactor - 1.0) > 0.01 || scene.warmth > 0.01
+        ColorAndHardwareEngine.shared.userSelectedHDR12Bit[displayID] = false
+        _ = ColorAndHardwareEngine.shared.selectBitDepth(.bit16, for: displayID, reapplyLUT: !hasCustomXDRWarmth)
+        _ = ColorAndHardwareEngine.shared.forceBestRGB444Mode(for: displayID)
 
         // 3. Apply XDR boost / dimming & warmth
         setXDRLuminance(for: displayID, factor: scene.xdrFactor)
         setWarmth(for: displayID, warmth: scene.warmth)
 
-        // 4. Apply DDC hardware RGB gain
+        // 4. Apply ICC profile if specified (skip delayed bit-depth LUT overwrite when custom XDR/warmth owns gamma)
+        if let keyword = scene.iccKeyword,
+           let prof = ColorAndHardwareEngine.shared.availableProfiles.first(where: { $0.name.localizedCaseInsensitiveContains(keyword) }) {
+            _ = ColorAndHardwareEngine.shared.applyColorProfile(prof, for: displayID, reapplyBitDepthLUT: !hasCustomXDRWarmth)
+        }
+
+        // 5. Queue serialized DDC brightness, contrast, and R/G/B gains.
+        // When resolution just switched, wait until monitor scaler/TMDS finishes mode resync before sending I2C writes.
+        let ddcDelayMs = didSwitchResolution ? 750 : 160
+        setHardwareBrightness(for: displayID, value: scene.brightness, force: true, delayMs: ddcDelayMs, showHUD: false)
+        setHardwareContrast(for: displayID, value: scene.contrast, force: true, delayMs: ddcDelayMs)
         ColorAndHardwareEngine.shared.setHardwareRGBGain(
             for: displayID,
             r: scene.rgbGain.0,
             g: scene.rgbGain.1,
-            b: scene.rgbGain.2
+            b: scene.rgbGain.2,
+            force: true,
+            delayMs: ddcDelayMs
         )
 
-        // 5. Apply ICC profile if specified
-        if let keyword = scene.iccKeyword,
-           let prof = ColorAndHardwareEngine.shared.availableProfiles.first(where: { $0.name.localizedCaseInsensitiveContains(keyword) }) {
-            _ = ColorAndHardwareEngine.shared.applyColorProfile(prof, for: displayID)
-        }
-
-        // 6. Ensure highest 16-bit FP16 bit depth
-        _ = ColorAndHardwareEngine.shared.stabilizeHighestBitDepth(for: displayID)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-            self?.refreshDisplays()
-            self?.statusMessage = "已激活情景模式：【\(scene.title)】"
+        // 6. Re-stabilize Pure RGB 4:4:4 link, highest bit depth, and final LUT after resolution/ColorSync settle
+        let settleDelay = didSwitchResolution ? 0.50 : 0.30
+        DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay) { [weak self] in
+            guard let self = self else { return }
+            self.lastUserWriteTime = Date()
+            _ = ColorAndHardwareEngine.shared.forceBestRGB444Mode(for: displayID)
+            _ = ColorAndHardwareEngine.shared.stabilizeHighestBitDepth(for: displayID)
+            if hasCustomXDRWarmth {
+                XDRBrightnessEngine.shared.setLuminance(
+                    for: displayID,
+                    factor: Float(scene.xdrFactor),
+                    warmth: Float(scene.warmth)
+                )
+            } else {
+                ColorAndHardwareEngine.shared.applyBitDepthLUTAndDithering(.bit16, for: displayID)
+            }
+            self.refreshDisplays()
+            self.statusMessage = "已激活情景模式：【\(scene.title)】"
             HUDManager.shared.show(
                 icon: scene.icon,
                 title: scene.title,
@@ -501,24 +533,39 @@ public final class DisplayStore: ObservableObject {
 
     // MARK: - Actions
 
-    public func setHardwareBrightness(for displayID: CGDirectDisplayID, value: Double) {
+    public func setHardwareBrightness(
+        for displayID: CGDirectDisplayID,
+        value: Double,
+        force: Bool = false,
+        delayMs: Int = 160,
+        showHUD: Bool = true
+    ) {
         lastUserWriteTime = Date()
         let clamped = max(0.0, min(100.0, value))
         ddcBrightness[displayID] = clamped
-        HUDManager.shared.show(
-            icon: "sun.max.fill",
-            title: "硬件亮度",
-            subtitle: "\(Int(clamped))%",
-            progress: clamped / 100.0,
-            tint: .yellow
-        )
+        if showHUD {
+            HUDManager.shared.show(
+                icon: "sun.max.fill",
+                title: "硬件亮度",
+                subtitle: "\(Int(clamped))%",
+                progress: clamped / 100.0,
+                tint: .yellow
+            )
+        }
 
-        if DDCController.shared.setNativeBrightness(displayID: displayID, brightness: Float(clamped / 100.0)) {
+        let supportsDDC = displays.first(where: { $0.id == displayID })?.supportsDDC ?? false
+        if !supportsDDC && DDCController.shared.setNativeBrightness(displayID: displayID, brightness: Float(clamped / 100.0)) {
             statusMessage = "已设置原生屏幕亮度: \(Int(clamped))%"
             return
         }
 
-        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .brightness, value: UInt16(clamped)) { [weak self] ok in
+        DDCController.shared.writeDDCDebounced(
+            displayID: displayID,
+            code: .brightness,
+            value: UInt16(clamped.rounded()),
+            force: force,
+            delayMs: delayMs
+        ) { [weak self] ok in
             Task { @MainActor in
                 if ok {
                     self?.statusMessage = "DDC/CI 硬件亮度 (0x10) 已更新: \(Int(clamped))%"
@@ -531,11 +578,22 @@ public final class DisplayStore: ObservableObject {
         }
     }
 
-    public func setHardwareContrast(for displayID: CGDirectDisplayID, value: Double) {
+    public func setHardwareContrast(
+        for displayID: CGDirectDisplayID,
+        value: Double,
+        force: Bool = false,
+        delayMs: Int = 160
+    ) {
         lastUserWriteTime = Date()
         let clamped = max(0.0, min(100.0, value))
         ddcContrast[displayID] = clamped
-        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .contrast, value: UInt16(clamped)) { [weak self] ok in
+        DDCController.shared.writeDDCDebounced(
+            displayID: displayID,
+            code: .contrast,
+            value: UInt16(clamped.rounded()),
+            force: force,
+            delayMs: delayMs
+        ) { [weak self] ok in
             Task { @MainActor in
                 self?.statusMessage = ok
                     ? "DDC/CI 硬件对比度 (0x12) 已更新: \(Int(clamped))%"

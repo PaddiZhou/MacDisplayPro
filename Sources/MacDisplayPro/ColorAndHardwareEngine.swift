@@ -207,11 +207,13 @@ public final class ColorAndHardwareEngine: ObservableObject {
         return forceBestRGB444Mode(for: displayID)
     }
 
-    public func selectBitDepth(_ choice: BitDepthChoice, for displayID: CGDirectDisplayID) -> String {
+    public func selectBitDepth(_ choice: BitDepthChoice, for displayID: CGDirectDisplayID, reapplyLUT: Bool = true) -> String {
         selectedBitDepth[displayID] = choice
         UserDefaults.standard.set(choice.rawValue, forKey: "mdp.bitDepth.\(displayID)")
         _ = MDP_LockHighestBitDepthForCurrentMode(displayID)
-        applyBitDepthLUTAndDithering(choice, for: displayID)
+        if reapplyLUT {
+            applyBitDepthLUTAndDithering(choice, for: displayID)
+        }
         return "已启用 \(choice.title)：\(choice.subtitle)"
     }
 
@@ -339,7 +341,11 @@ public final class ColorAndHardwareEngine: ObservableObject {
     }
 
     /// Applies an ICC Color Profile immediately via ColorSync
-    public func applyColorProfile(_ option: ColorProfileOption, for displayID: CGDirectDisplayID) -> (success: Bool, message: String) {
+    public func applyColorProfile(
+        _ option: ColorProfileOption,
+        for displayID: CGDirectDisplayID,
+        reapplyBitDepthLUT: Bool = true
+    ) -> (success: Bool, message: String) {
         let ok = MDP_SetDisplayColorProfileURL(displayID, option.url)
         UserDefaults.standard.set(option.url?.path ?? "factory", forKey: "mdp.savedICC.\(displayID)")
 
@@ -349,10 +355,12 @@ public final class ColorAndHardwareEngine: ObservableObject {
             activeProfileURL[displayID] = option.url
         }
 
-        // Re-apply bit-depth LUT micro-dithering after ColorSync reloads the ICC profile
-        let depthChoice = selectedBitDepth[displayID] ?? .bit16
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            self?.applyBitDepthLUTAndDithering(depthChoice, for: displayID)
+        // Re-apply bit-depth LUT micro-dithering after ColorSync reloads the ICC profile (skip when a custom XDR/warmth LUT owns gamma)
+        if reapplyBitDepthLUT {
+            let depthChoice = selectedBitDepth[displayID] ?? .bit16
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                self?.applyBitDepthLUTAndDithering(depthChoice, for: displayID)
+            }
         }
 
         if ok {
@@ -374,13 +382,23 @@ public final class ColorAndHardwareEngine: ObservableObject {
 
     // MARK: - Hardware DDC RGB Gain Calibration (VCP 0x16 / 0x18 / 0x1A)
 
-    public func setHardwareRGBGain(for displayID: CGDirectDisplayID, r: Double, g: Double, b: Double) {
-        redGain[displayID] = r
-        greenGain[displayID] = g
-        blueGain[displayID] = b
+    public func setHardwareRGBGain(
+        for displayID: CGDirectDisplayID,
+        r: Double,
+        g: Double,
+        b: Double,
+        force: Bool = false,
+        delayMs: Int = 160
+    ) {
+        let clampedR = max(0.0, min(100.0, r))
+        let clampedG = max(0.0, min(100.0, g))
+        let clampedB = max(0.0, min(100.0, b))
+        redGain[displayID] = clampedR
+        greenGain[displayID] = clampedG
+        blueGain[displayID] = clampedB
 
-        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .redGain, value: UInt16(r))
-        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .greenGain, value: UInt16(g))
-        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .blueGain, value: UInt16(b))
+        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .redGain, value: UInt16(clampedR.rounded()), force: force, delayMs: delayMs)
+        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .greenGain, value: UInt16(clampedG.rounded()), force: force, delayMs: delayMs)
+        DDCController.shared.writeDDCDebounced(displayID: displayID, code: .blueGain, value: UInt16(clampedB.rounded()), force: force, delayMs: delayMs)
     }
 }

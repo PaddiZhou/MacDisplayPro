@@ -125,10 +125,10 @@ bool MDP_GetNativeDisplayBrightness(CGDirectDisplayID displayID, float *outBrigh
             cdGet = (CoreDisplayGetUserBrightnessFunc)dlsym(cdHandle, "CoreDisplay_Display_GetUserBrightness");
         }
     });
-    if (dsGet && dsGet(displayID, outBrightness) == 0) {
-        return true;
+    if (dsGet) {
+        return (dsGet(displayID, outBrightness) == 0);
     }
-    if (cdGet) {
+    if (cdGet && CGDisplayIsBuiltin(displayID)) {
         double val = cdGet(displayID);
         if (val >= 0.0 && val <= 1.0) {
             *outBrightness = (float)val;
@@ -153,10 +153,10 @@ bool MDP_SetNativeDisplayBrightness(CGDirectDisplayID displayID, float brightnes
             cdSet = (CoreDisplaySetUserBrightnessFunc)dlsym(cdHandle, "CoreDisplay_Display_SetUserBrightness");
         }
     });
-    if (dsSet && dsSet(displayID, clamped) == 0) {
-        return true;
+    if (dsSet) {
+        return (dsSet(displayID, clamped) == 0);
     }
-    if (cdSet) {
+    if (cdSet && CGDisplayIsBuiltin(displayID)) {
         cdSet(displayID, (double)clamped);
         return true;
     }
@@ -494,8 +494,13 @@ bool MDP_WriteDDCValue(CGDirectDisplayID displayID, uint8_t vcpCode, uint16_t va
 
     CFTypeRef avService = MDP_CopyIOAVServiceForDisplay(displayID, NULL);
     if (avService && writeI2C) {
-        // Single clean I2C transaction to protect monitor EEPROM write endurance
-        IOReturn ret = writeI2C(avService, 0x37, 0x51, packet, sizeof(packet));
+        // Retry once on transient I2C NACK/bus busy while keeping EEPROM writes minimal
+        IOReturn ret = kIOReturnError;
+        for (int attempt = 0; attempt < 2; attempt++) {
+            ret = writeI2C(avService, 0x37, 0x51, packet, sizeof(packet));
+            if (ret == kIOReturnSuccess) break;
+            [NSThread sleepForTimeInterval:0.04];
+        }
         CFRelease(avService);
         return (ret == kIOReturnSuccess);
     }
